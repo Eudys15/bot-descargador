@@ -2,9 +2,10 @@ import os
 import asyncio
 import json
 import datetime
+import time
 import boto3
 from botocore.exceptions import ClientError
-from botocore.config import Config  # <-- NUEVO: Para corregir el error de Backblaze
+from botocore.config import Config
 from telethon import TelegramClient, events
 from aiohttp import web
 
@@ -31,7 +32,6 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # ==========================================
 client = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Configuración especial para evitar el error de conexión con Backblaze B2
 b2_config = Config(
     request_checksum_calculation="when_required",
     connect_timeout=30,
@@ -44,7 +44,7 @@ s3_client = boto3.client(
     aws_access_key_id=S3_ACCESS_KEY,
     aws_secret_access_key=S3_SECRET_KEY,
     region_name=S3_REGION,
-    config=b2_config  # Aplicamos la configuración corregida
+    config=b2_config
 )
 
 # ==========================================
@@ -97,7 +97,7 @@ async def bucle_limpieza():
             guardar_registro(registro_actualizado)
 
 # ==========================================
-# 4. MANEJADORES DEL BOT (MODO RÁPIDO)
+# 4. MANEJADORES DEL BOT (PROGRESO 1% CON FRENO DE SEGURIDAD)
 # ==========================================
 @client.on(events.NewMessage(pattern='/start'))
 async def start(event):
@@ -107,37 +107,59 @@ async def start(event):
         "El enlace durará 23 horas."
     )
 
-# Filtro: Ignora sus propios mensajes y solo responde a archivos entrantes
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.media and not e.out))
 async def handle_incoming_file(event):
-    msg = await event.respond('⏳ **Procesando archivo... (esto puede tardar)**')
+    msg = await event.respond('⏳ **Iniciando proceso...**')
     file_path = None
     
     try:
-        # --- FASE DE DESCARGA (SILENCIOSA PARA EVITAR SPAM) ---
-        file_path = await event.message.download_media(file=DOWNLOAD_DIR)
+        # --- FASE DE DESCARGA (PROGRESO 1% CADA 2 SEGUNDOS) ---
+        last_download_percent = [0]
+        last_download_time = [0]
+
+        async def download_progress(current, total):
+            percent = int((current / total) * 100)
+            current_time = time.time()
+            
+            # Actualiza cada 1% pero máximo cada 2 segundos para evitar FloodWait
+            if percent == 100 or (percent > last_download_percent[0] and current_time - last_download_time[0] >= 2):
+                last_download_percent[0] = percent
+                last_download_time[0] = current_time
+                barra = '█' * (percent // 10) + '░' * (10 - percent // 10)
+                try:
+                    await msg.edit(f"⏳ **Descargando de Telegram...**\n`[{barra}] {percent}%`")
+                except:
+                    pass
+
+        file_path = await event.message.download_media(
+            file=DOWNLOAD_DIR,
+            progress_callback=download_progress
+        )
         
         if event.file and event.file.name:
             object_name = event.file.name
         else:
             object_name = os.path.basename(file_path)
 
-        # --- FASE DE SUBIDA (PROGRESO CADA 25% PARA SER RÁPIDO) ---
+        # --- FASE DE SUBIDA (PROGRESO 1% CADA 2 SEGUNDOS) ---
         total_size = os.path.getsize(file_path)
         last_upload_percent = [0]
+        last_upload_time = [0]
         loop = asyncio.get_running_loop()
 
         def upload_progress(bytes_transferred):
             percent = int((bytes_transferred / total_size) * 100)
-            # Solo actualizamos cada 25% para ser rapidísimos y no saturar Telegram
-            if percent >= last_upload_percent[0] + 25 or percent == 100:
+            current_time = time.time()
+            
+            if percent == 100 or (percent > last_upload_percent[0] and current_time - last_upload_time[0] >= 2):
                 last_upload_percent[0] = percent
-                text = f"☁️ **Subiendo a la nube...** {percent}%"
+                last_upload_time[0] = current_time
+                barra = '█' * (percent // 10) + '░' * (10 - percent // 10)
+                text = f"☁️ **Subiendo a Backblaze...**\n`[{barra}] {percent}%`"
                 asyncio.run_coroutine_threadsafe(msg.edit(text), loop)
 
-        await msg.edit("☁️ **Subiendo a la nube...** 0%")
+        await msg.edit("☁️ **Subiendo a Backblaze...**\n`[░░░░░░░░░░] 0%`")
 
-        # Subir archivo en un hilo separado
         await asyncio.to_thread(
             s3_client.upload_file,
             file_path,
