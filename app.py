@@ -9,37 +9,28 @@ from telethon import TelegramClient, events
 from aiohttp import web
 
 # ==========================================
-# 1. CONFIGURACIÓN (LEÍDA DESDE VARIABLES DE ENTORNO)
+# 1. CONFIGURACIÓN (CON TUS NUEVAS CLAVES)
 # ==========================================
-# Limpiamos los valores con .strip() para eliminar espacios, saltos de línea 
-# y comillas invisibles que se cuelan al copiar/pegar en Render.
+API_ID = 30532391
+API_HASH = 'a7f3b317bdc77e830aac38d94fea1a9e'
+BOT_TOKEN = '8825189315:AAHRbuCcyQq8SvT_-eHDDyHVhfpjQefOjZE'
 
-API_ID = int(os.environ.get('API_ID', '0').strip())
-API_HASH = os.environ.get('API_HASH', '').strip().strip('"').strip("'")
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip().strip('"').strip("'")
-
-S3_ENDPOINT = os.environ.get('S3_ENDPOINT', '').strip().strip('"').strip("'")
-S3_ACCESS_KEY = os.environ.get('S3_ACCESS_KEY', '').strip().strip('"').strip("'")
-S3_SECRET_KEY = os.environ.get('S3_SECRET_KEY', '').strip().strip('"').strip("'")
-S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', '').strip().strip('"').strip("'")
-S3_REGION = os.environ.get('S3_REGION', 'auto').strip().strip('"').strip("'")
-
-# --- DIAGNÓSTICO EN CONSOLA ---
-print(f"🔑 Longitud de S3_ACCESS_KEY: {len(S3_ACCESS_KEY)} caracteres")
-print(f"🔑 Primeros 4 caracteres: {S3_ACCESS_KEY[:4]}")
-print(f"🔑 Últimos 4 caracteres: {S3_ACCESS_KEY[-4:]}")
-# ------------------------------
+S3_ENDPOINT = 'https://s3.us-east-005.backblazeb2.com'
+S3_ACCESS_KEY = '005334e40bda059000000002'  # Tu nueva keyID
+S3_SECRET_KEY = 'K005Z7wRwTQjyGtnG149Zrke2J28VLI' # Tu nueva applicationKey
+S3_BUCKET_NAME = 'Descargador-videos-telegram'
+S3_REGION = 'us-east-005'
 
 HORAS_PARA_BORRAR = 23
 ARCHIVO_REGISTRO = '/tmp/registro_borrado.json'
-PART_SIZE = 50 * 1024 * 1024  # 50 MB por parte para subida multiparte
+PART_SIZE = 10 * 1024 * 1024  # 10 MB por parte para subida multiparte (seguro para 512MB RAM)
 
 # ==========================================
 # 2. INICIAR CLIENTES (CON CORRECCIÓN PARA BACKBLAZE)
 # ==========================================
 client = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Configuración especial para evitar el error de conexión con Backblaze B2
+# Configuración especial para evitar errores de conexión con Backblaze B2
 b2_config = Config(
     request_checksum_calculation="when_required",
     response_checksum_validation="when_required",
@@ -128,10 +119,10 @@ async def stream_telegram_to_s3_multipart(message, object_name, status_msg):
 
     try:
         # Iterar sobre los fragmentos de Telegram
-        async for chunk in client.iter_download(message.media, chunk_size=1024*1024): # 1 MB chunks de Telegram
+        async for chunk in client.iter_download(message.media, chunk_size=1024*1024): # 1 MB chunks
             buffer.extend(chunk)
             
-            # Cuando el búfer alcanza los 50 MB, subimos una parte
+            # Cuando el búfer alcanza el tamaño de parte (10 MB), subimos una parte
             if len(buffer) >= PART_SIZE:
                 part = await asyncio.to_thread(
                     s3_client.upload_part,
@@ -197,6 +188,7 @@ async def start(event):
         "El enlace durará 23 horas."
     )
 
+# Filtro anti-spam: Ignora sus propios mensajes y solo responde a archivos entrantes
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.media and not e.out))
 async def handle_incoming_file(event):
     msg = await event.respond('⏳ **Iniciando proceso...**')
