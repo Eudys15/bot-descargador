@@ -1,0 +1,4 @@
+telethon
+boto3
+python-dotenv
+aiohttp
