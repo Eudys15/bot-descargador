@@ -11,19 +11,28 @@ from aiohttp import web
 # ==========================================
 # 1. CONFIGURACIÓN (LEÍDA DESDE VARIABLES DE ENTORNO)
 # ==========================================
-API_ID = int(os.environ.get('API_ID', 0))
-API_HASH = os.environ.get('API_HASH', '')
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+# Limpiamos los valores con .strip() para eliminar espacios, saltos de línea 
+# y comillas invisibles que se cuelan al copiar/pegar en Render.
 
-S3_ENDPOINT = os.environ.get('S3_ENDPOINT', '')
-S3_ACCESS_KEY = os.environ.get('S3_ACCESS_KEY', '')
-S3_SECRET_KEY = os.environ.get('S3_SECRET_KEY', '')
-S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', '')
-S3_REGION = os.environ.get('S3_REGION', 'auto')
+API_ID = int(os.environ.get('API_ID', '0').strip())
+API_HASH = os.environ.get('API_HASH', '').strip().strip('"').strip("'")
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip().strip('"').strip("'")
+
+S3_ENDPOINT = os.environ.get('S3_ENDPOINT', '').strip().strip('"').strip("'")
+S3_ACCESS_KEY = os.environ.get('S3_ACCESS_KEY', '').strip().strip('"').strip("'")
+S3_SECRET_KEY = os.environ.get('S3_SECRET_KEY', '').strip().strip('"').strip("'")
+S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', '').strip().strip('"').strip("'")
+S3_REGION = os.environ.get('S3_REGION', 'auto').strip().strip('"').strip("'")
+
+# --- DIAGNÓSTICO EN CONSOLA ---
+print(f"🔑 Longitud de S3_ACCESS_KEY: {len(S3_ACCESS_KEY)} caracteres")
+print(f"🔑 Primeros 4 caracteres: {S3_ACCESS_KEY[:4]}")
+print(f"🔑 Últimos 4 caracteres: {S3_ACCESS_KEY[-4:]}")
+# ------------------------------
 
 HORAS_PARA_BORRAR = 23
 ARCHIVO_REGISTRO = '/tmp/registro_borrado.json'
-PART_SIZE = 50 * 1024 * 1024  # 50 MB por parte (para multipart upload)
+PART_SIZE = 50 * 1024 * 1024  # 50 MB por parte para subida multiparte
 
 # ==========================================
 # 2. INICIAR CLIENTES (CON CORRECCIÓN PARA BACKBLAZE)
@@ -137,7 +146,7 @@ async def stream_telegram_to_s3_multipart(message, object_name, status_msg):
                 bytes_subidos += len(buffer)
                 buffer = bytearray()
                 
-                # Actualizar progreso (cada 5% aprox)
+                # Actualizar progreso
                 if total_size > 0:
                     percent = int((bytes_subidos / total_size) * 100)
                     barra = '█' * (percent // 10) + '░' * (10 - percent // 10)
