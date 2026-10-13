@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import datetime
+import time
 import boto3
 from botocore.exceptions import ClientError
 from telethon import TelegramClient, events
@@ -83,7 +84,6 @@ async def bucle_limpieza():
                     registro_actualizado.append(item)
             except Exception as e:
                 print(f"Error procesando registro: {e}")
-                
         if len(registro_actualizado) != len(registro):
             guardar_registro(registro_actualizado)
 
@@ -100,7 +100,6 @@ async def start(event):
 
 @client.on(events.NewMessage)
 async def handle_incoming_file(event):
-    # Ignorar por completo si no es un archivo o video
     if not event.message.media:
         return
 
@@ -108,18 +107,23 @@ async def handle_incoming_file(event):
     file_path = None
     
     try:
-        # --- FASE DE DESCARGA (CON PROGRESO) ---
+        # --- FASE DE DESCARGA (PROGRESO EN TIEMPO REAL) ---
         last_download_percent = [0]
-        
+        last_update_time = [0]
+
         async def download_progress(current, total):
             percent = int((current / total) * 100)
-            if percent >= last_download_percent[0] + 10 or percent == 100:
+            current_time = time.time()
+            
+            # Actualizar cada 1% pero máximo cada 2 segundos para evitar spam en Telegram
+            if percent == 100 or (percent > last_download_percent[0] and current_time - last_update_time[0] >= 2):
                 last_download_percent[0] = percent
+                last_update_time[0] = current_time
                 barra = '█' * (percent // 10) + '░' * (10 - percent // 10)
                 try:
                     await msg.edit(f"⏳ **Descargando de Telegram...**\n`[{barra}] {percent}%`")
-                except:
-                    pass # Evitar errores si Telegram limita la velocidad de edición
+                except Exception:
+                    pass
 
         file_path = await event.message.download_media(
             file=DOWNLOAD_DIR,
@@ -131,18 +135,21 @@ async def handle_incoming_file(event):
         else:
             object_name = os.path.basename(file_path)
 
-        # --- FASE DE SUBIDA (CON PROGRESO) ---
+        # --- FASE DE SUBIDA (PROGRESO EN TIEMPO REAL) ---
         total_size = os.path.getsize(file_path)
         last_upload_percent = [0]
+        last_upload_time = [0]
         loop = asyncio.get_running_loop()
 
         def upload_progress(bytes_transferred):
             percent = int((bytes_transferred / total_size) * 100)
-            if percent >= last_upload_percent[0] + 10 or percent == 100:
+            current_time = time.time()
+            
+            if percent == 100 or (percent > last_upload_percent[0] and current_time - last_upload_time[0] >= 2):
                 last_upload_percent[0] = percent
+                last_upload_time[0] = current_time
                 barra = '█' * (percent // 10) + '░' * (10 - percent // 10)
                 text = f"☁️ **Subiendo a Backblaze...**\n`[{barra}] {percent}%`"
-                # Ejecutar la edición de forma segura desde el hilo de boto3
                 asyncio.run_coroutine_threadsafe(msg.edit(text), loop)
 
         await msg.edit("☁️ **Subiendo a Backblaze...**\n`[░░░░░░░░░░] 0%`")
