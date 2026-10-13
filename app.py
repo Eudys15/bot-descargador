@@ -21,8 +21,8 @@ S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', '')
 S3_REGION = os.environ.get('S3_REGION', 'auto')
 
 HORAS_PARA_BORRAR = 23
-ARCHIVO_REGISTRO = 'registro_borrado.json'
-DOWNLOAD_DIR = 'descargas_temp'
+ARCHIVO_REGISTRO = '/tmp/registro_borrado.json'
+DOWNLOAD_DIR = '/tmp/descargas_temp'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ==========================================
@@ -59,20 +59,6 @@ def agregar_al_registro(object_name):
         "fecha_borrado": hora_borrado.strftime('%Y-%m-%d %H:%M:%S')
     })
     guardar_registro(registro)
-    print(f"📝 Registrado: {object_name} se borrará el {hora_borrado.strftime('%Y-%m-%d %H:%M:%S')}")
-
-def upload_to_s3(file_path, object_name):
-    try:
-        s3_client.upload_file(file_path, S3_BUCKET_NAME, object_name)
-        url = s3_client.generate_presigned_url(
-            'get_object',
-            Params={'Bucket': S3_BUCKET_NAME, 'Key': object_name},
-            ExpiresIn=HORAS_PARA_BORRAR * 3600
-        )
-        return url
-    except ClientError as e:
-        print(f"Error al subir a S3: {e}")
-        return None
 
 def delete_from_s3(object_name):
     try:
@@ -84,7 +70,7 @@ def delete_from_s3(object_name):
 async def bucle_limpieza():
     print("🔄 Iniciando bucle de limpieza automática...")
     while True:
-        await asyncio.sleep(300) # Revisar cada 5 minutos
+        await asyncio.sleep(300)
         registro = cargar_registro()
         ahora = datetime.datetime.now()
         registro_actualizado = []
@@ -108,42 +94,83 @@ async def bucle_limpieza():
 async def start(event):
     await event.respond(
         "¡Hola! 👋 Soy tu bot subidor.\n\n"
-        "Envíame un video o archivo (como documento) y lo subiré a Backblaze.\n"
+        "Envíame un video o archivo (como documento) y lo subiré a la nube.\n"
         "El enlace y el archivo durarán 23 horas."
     )
 
 @client.on(events.NewMessage)
 async def handle_incoming_file(event):
+    # Ignorar por completo si no es un archivo o video
     if not event.message.media:
-        if event.message.text and not event.message.text.startswith('/'):
-            await event.respond("⚠️ Por favor, envíame un archivo o video para subirlo a la nube.")
         return
 
-    msg = await event.respond('⏳ **Descargando archivo desde Telegram...**')
-    
+    msg = await event.respond('⏳ **Iniciando proceso...**')
     file_path = None
+    
     try:
-        file_path = await event.message.download_media(file=DOWNLOAD_DIR)
+        # --- FASE DE DESCARGA (CON PROGRESO) ---
+        last_download_percent = [0]
+        
+        async def download_progress(current, total):
+            percent = int((current / total) * 100)
+            if percent >= last_download_percent[0] + 10 or percent == 100:
+                last_download_percent[0] = percent
+                barra = '█' * (percent // 10) + '░' * (10 - percent // 10)
+                try:
+                    await msg.edit(f"⏳ **Descargando de Telegram...**\n`[{barra}] {percent}%`")
+                except:
+                    pass # Evitar errores si Telegram limita la velocidad de edición
+
+        file_path = await event.message.download_media(
+            file=DOWNLOAD_DIR,
+            progress_callback=download_progress
+        )
         
         if event.file and event.file.name:
             object_name = event.file.name
         else:
             object_name = os.path.basename(file_path)
 
-        await msg.edit('☁️ **Subiendo a Backblaze... (esto puede tardar según el tamaño)**')
-        
-        download_url = upload_to_s3(file_path, object_name)
+        # --- FASE DE SUBIDA (CON PROGRESO) ---
+        total_size = os.path.getsize(file_path)
+        last_upload_percent = [0]
+        loop = asyncio.get_running_loop()
 
-        if download_url:
-            agregar_al_registro(object_name)
-            await msg.edit(
-                f"✅ **¡Listo!**\n\n"
-                f"📁 **Archivo:** {object_name}\n\n"
-                f"🔗 **[Haz clic aquí para descargar]({download_url})**\n\n"
-                f"⏳ *El enlace y el archivo se eliminarán en 23 horas.*"
-            )
-        else:
-            await msg.edit('❌ **Error al subir a Backblaze. Revisa las claves o los permisos.**')
+        def upload_progress(bytes_transferred):
+            percent = int((bytes_transferred / total_size) * 100)
+            if percent >= last_upload_percent[0] + 10 or percent == 100:
+                last_upload_percent[0] = percent
+                barra = '█' * (percent // 10) + '░' * (10 - percent // 10)
+                text = f"☁️ **Subiendo a Backblaze...**\n`[{barra}] {percent}%`"
+                # Ejecutar la edición de forma segura desde el hilo de boto3
+                asyncio.run_coroutine_threadsafe(msg.edit(text), loop)
+
+        await msg.edit("☁️ **Subiendo a Backblaze...**\n`[░░░░░░░░░░] 0%`")
+
+        # Subir en un hilo separado para no congelar el bot
+        await asyncio.to_thread(
+            s3_client.upload_file,
+            file_path,
+            S3_BUCKET_NAME,
+            object_name,
+            Callback=upload_progress
+        )
+
+        # --- GENERAR ENLACE FINAL ---
+        download_url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': S3_BUCKET_NAME, 'Key': object_name},
+            ExpiresIn=HORAS_PARA_BORRAR * 3600
+        )
+        
+        agregar_al_registro(object_name)
+        
+        await msg.edit(
+            f"✅ **¡Listo!**\n\n"
+            f"📁 **Archivo:** {object_name}\n\n"
+            f"🔗 **[Haz clic aquí para descargar]({download_url})**\n\n"
+            f"⏳ *El enlace y el archivo se eliminarán en 23 horas.*"
+        )
 
     except Exception as e:
         await msg.edit(f'❌ **Error:**\n`{str(e)}`')
@@ -151,7 +178,6 @@ async def handle_incoming_file(event):
         try:
             if file_path and os.path.exists(file_path):
                 os.remove(file_path)
-                print(f"Archivo temporal borrado del teléfono: {file_path}")
         except Exception as cleanup_error:
             print(f"No se pudo borrar el archivo temporal: {cleanup_error}")
 
@@ -159,19 +185,17 @@ async def handle_incoming_file(event):
 # 5. SERVIDOR WEB (OBLIGATORIO PARA RENDER)
 # ==========================================
 async def handle_web(request):
-    """Responde a las visitas de Render para que no apague el bot."""
-    return web.Response(text="🤖 Bot de Telegram funcionando correctamente.")
+    return web.Response(text="🤖 Bot funcionando correctamente.")
 
 async def iniciar_servidor_web():
     app = web.Application()
     app.router.add_get('/', handle_web)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render asigna un puerto dinámico en la variable de entorno PORT
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"🌐 Servidor web escuchando en el puerto {port} (para mantener a Render despierto)")
+    print(f"🌐 Servidor web escuchando en el puerto {port}")
 
 # ==========================================
 # 6. EJECUTAR
@@ -182,9 +206,7 @@ if __name__ == '__main__':
     print(f"Los archivos se registrarán y borrarán {HORAS_PARA_BORRAR} horas después.")
     print("=========================================")
     
-    # Iniciar tareas asíncronas en segundo plano
     client.loop.create_task(iniciar_servidor_web())
     client.loop.create_task(bucle_limpieza())
     
-    # Mantener el bot de Telegram escuchando
     client.run_until_disconnected()
