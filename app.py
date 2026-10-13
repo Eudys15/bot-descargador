@@ -2,13 +2,11 @@ import os
 import asyncio
 import json
 import datetime
-import time
 import boto3
 from botocore.exceptions import ClientError
 from botocore.config import Config
 from telethon import TelegramClient, events
 from aiohttp import web
-from io import BytesIO
 
 # ==========================================
 # 1. CONFIGURACIÓN (LEÍDA DESDE VARIABLES DE ENTORNO)
@@ -25,19 +23,22 @@ S3_REGION = os.environ.get('S3_REGION', 'auto')
 
 HORAS_PARA_BORRAR = 23
 ARCHIVO_REGISTRO = '/tmp/registro_borrado.json'
-CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB por fragmento
-
-os.makedirs('/tmp', exist_ok=True)
+PART_SIZE = 50 * 1024 * 1024  # 50 MB por parte (para multipart upload)
 
 # ==========================================
 # 2. INICIAR CLIENTES (CON CORRECCIÓN PARA BACKBLAZE)
 # ==========================================
 client = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
+# Configuración especial para evitar el error de conexión con Backblaze B2
 b2_config = Config(
     request_checksum_calculation="when_required",
-    connect_timeout=30,
-    read_timeout=120
+    response_checksum_validation="when_required",
+    retries={'max_attempts': 10, 'mode': 'adaptive'},
+    connect_timeout=60,
+    read_timeout=300,
+    max_pool_connections=10,
+    tcp_keepalive=True
 )
 
 s3_client = boto3.client(
@@ -99,38 +100,44 @@ async def bucle_limpieza():
             guardar_registro(registro_actualizado)
 
 # ==========================================
-# 4. FUNCIÓN DE STREAMING (TELEGRAM -> S3)
+# 4. FUNCIÓN DE STREAMING MULTIPARTE (TELEGRAM -> S3)
 # ==========================================
-async def stream_telegram_to_s3(message, object_name, status_msg):
-    """
-    Descarga el archivo de Telegram en fragmentos y lo sube a S3
-    usando upload_fileobj (multipart) sin guardar el archivo completo en disco.
-    """
+async def stream_telegram_to_s3_multipart(message, object_name, status_msg):
+    total_size = message.file.size if message.file else 0
+    
+    # Iniciar subida multiparte
+    mpu = await asyncio.to_thread(
+        s3_client.create_multipart_upload,
+        Bucket=S3_BUCKET_NAME,
+        Key=object_name
+    )
+    upload_id = mpu['UploadId']
+    parts = []
+    part_number = 1
+    buffer = bytearray()
+    bytes_subidos = 0
+
     try:
-        # Buffer en memoria para acumular fragmentos
-        buffer = BytesIO()
-        bytes_acumulados = 0
-        total_size = message.file.size if message.file else 0
-        bytes_subidos = 0
-
-        # Descargar e ir subiendo fragmento a fragmento
-        async for chunk in client.iter_download(message.media, chunk_size=CHUNK_SIZE):
-            buffer.write(chunk)
-            bytes_acumulados += len(chunk)
-
-            # Cuando el buffer alcanza el tamaño de fragmento, subimos esa parte
-            if bytes_acumulados >= CHUNK_SIZE:
-                buffer.seek(0)
-                # En un flujo real, aquí se subiría el fragmento a S3
-                # Para multipart upload, se necesitaría usar create_multipart_upload
-                # y upload_part. Por simplicidad, usamos upload_fileobj con el buffer.
-                # NOTA: upload_fileobj maneja automáticamente el multipart si el buffer es grande.
-                s3_client.upload_fileobj(buffer, S3_BUCKET_NAME, object_name)
-                bytes_subidos += bytes_acumulados
-                buffer = BytesIO()
-                bytes_acumulados = 0
-
-                # Actualizar progreso
+        # Iterar sobre los fragmentos de Telegram
+        async for chunk in client.iter_download(message.media, chunk_size=1024*1024): # 1 MB chunks de Telegram
+            buffer.extend(chunk)
+            
+            # Cuando el búfer alcanza los 50 MB, subimos una parte
+            if len(buffer) >= PART_SIZE:
+                part = await asyncio.to_thread(
+                    s3_client.upload_part,
+                    Bucket=S3_BUCKET_NAME,
+                    Key=object_name,
+                    PartNumber=part_number,
+                    UploadId=upload_id,
+                    Body=bytes(buffer)
+                )
+                parts.append({'PartNumber': part_number, 'ETag': part['ETag']})
+                part_number += 1
+                bytes_subidos += len(buffer)
+                buffer = bytearray()
+                
+                # Actualizar progreso (cada 5% aprox)
                 if total_size > 0:
                     percent = int((bytes_subidos / total_size) * 100)
                     barra = '█' * (percent // 10) + '░' * (10 - percent // 10)
@@ -139,25 +146,45 @@ async def stream_telegram_to_s3(message, object_name, status_msg):
                     except:
                         pass
 
-        # Subir el último fragmento si queda algo en el buffer
-        if bytes_acumulados > 0:
-            buffer.seek(0)
-            s3_client.upload_fileobj(buffer, S3_BUCKET_NAME, object_name)
+        # Subir la última parte (si queda algo en el búfer)
+        if len(buffer) > 0:
+            part = await asyncio.to_thread(
+                s3_client.upload_part,
+                Bucket=S3_BUCKET_NAME,
+                Key=object_name,
+                PartNumber=part_number,
+                UploadId=upload_id,
+                Body=bytes(buffer)
+            )
+            parts.append({'PartNumber': part_number, 'ETag': part['ETag']})
+            bytes_subidos += len(buffer)
 
+        # Completar la subida multiparte
+        await asyncio.to_thread(
+            s3_client.complete_multipart_upload,
+            Bucket=S3_BUCKET_NAME,
+            Key=object_name,
+            UploadId=upload_id,
+            MultipartUpload={'Parts': parts}
+        )
         return True
 
     except Exception as e:
-        print(f"Error en streaming: {e}")
+        # Si hay error, abortar la subida multiparte para no dejar basura en S3
+        try:
+            await asyncio.to_thread(s3_client.abort_multipart_upload, Bucket=S3_BUCKET_NAME, Key=object_name, UploadId=upload_id)
+        except:
+            pass
         raise e
 
 # ==========================================
-# 5. MANEJADORES DEL BOT (MODO STREAMING)
+# 5. MANEJADORES DEL BOT
 # ==========================================
 @client.on(events.NewMessage(pattern='/start'))
 async def start(event):
     await event.respond(
         "¡Hola! 👋 Soy tu bot subidor.\n\n"
-        "Envíame un video o archivo y lo subiré a la nube.\n"
+        "Envíame un video o archivo (como documento) y lo subiré a la nube.\n"
         "El enlace durará 23 horas."
     )
 
@@ -166,17 +193,15 @@ async def handle_incoming_file(event):
     msg = await event.respond('⏳ **Iniciando proceso...**')
     
     try:
-        # Obtener nombre del archivo
         if event.file and event.file.name:
             object_name = event.file.name
         else:
-            # Generar un nombre único si no tiene
-            object_name = f"archivo_{int(time.time())}.mp4"
+            object_name = f"archivo_{int(datetime.datetime.now().timestamp())}.mp4"
 
-        # Iniciar streaming
         await msg.edit("☁️ **Subiendo a Backblaze...**\n`[░░░░░░░░░░] 0%`")
         
-        await stream_telegram_to_s3(event.message, object_name, msg)
+        # Iniciar streaming multiparte
+        await stream_telegram_to_s3_multipart(event.message, object_name, msg)
 
         # Generar enlace final
         download_url = s3_client.generate_presigned_url(
@@ -218,7 +243,7 @@ async def iniciar_servidor_web():
 # ==========================================
 if __name__ == '__main__':
     print("=========================================")
-    print("🤖 BOT SUBIDOR INICIADO EN RENDER (STREAMING)")
+    print("🤖 BOT SUBIDOR INICIADO EN RENDER (STREAMING MULTIPARTE)")
     print(f"Los archivos se registrarán y borrarán {HORAS_PARA_BORRAR} horas después.")
     print("=========================================")
     
